@@ -14,8 +14,9 @@ args = parser.parse_args()
 name, value = args.header.split(":", 1)
 headers = {name.strip(): " ".join(value.split())}
 
-WORDLIST_PATH = "/home/host/Github/Personal/RPCpwn/trigger.txt"
-PARAM_WORDLIST_PATH = "/home/host/Github/Personal/RPCpwn/params.txt"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WORDLIST_PATH = os.path.join(SCRIPT_DIR, "trigger.txt")
+PARAM_WORDLIST_PATH = os.path.join(SCRIPT_DIR, "params.txt")
 
 hostname = urlparse(args.url).hostname or "output"
 OUTPUT_PATH = f"discovered_endpoints_{hostname}.txt"
@@ -119,7 +120,8 @@ def test_name(name):
         if resp is None:
             results.append(f"{method} (ERR)")
             continue
-        results.append(f"{method} ({resp.status_code})")
+        if resp.status_code != 405:
+            results.append(f"{method} ({resp.status_code})")
         if resp.status_code == 401:
             unauthorized.add(f"{method} {url}")
         elif 200 <= resp.status_code < 300:
@@ -136,7 +138,8 @@ def test_name(name):
                 param_targets[name] = url
                 if params:
                     found_params.setdefault(name, set()).update(params)
-    print(f"{name}: " + " ".join(results))
+    if results:
+        print(f"{name}: " + " ".join(results))
 
 
 print("\n=== Stage 2: testing discovered endpoint names against FUZZ ===")
