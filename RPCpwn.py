@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import urllib3
@@ -8,49 +9,49 @@ from urllib.parse import urlparse
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
 
 class ProgressBar:
-    """Pinned spinner + counter at the bottom of the terminal. Results print
-    above it via print_above() without ever clobbering the bar itself."""
+    """Pinned '(current/total)' counter at the bottom of the terminal. Results
+    print above it via print_above() without ever clobbering the counter itself.
+    Thread-safe: stages fire requests from a pool of worker threads."""
 
     def __init__(self):
         self.total = 0
         self.current = 0
-        self.frame_idx = 0
         self.active = False
+        self._lock = threading.Lock()
 
     def start(self, total):
-        self.total = total
-        self.current = 0
-        self.frame_idx = 0
-        self.active = True
-        self._render()
-
-    def step(self, current=None):
-        if not self.active:
-            return
-        self.current = self.current + 1 if current is None else current
-        self.frame_idx = (self.frame_idx + 1) % len(SPINNER_FRAMES)
-        self._render()
-
-    def _render(self):
-        frame = SPINNER_FRAMES[self.frame_idx]
-        sys.stdout.write(f"\r\x1b[2K{frame} ({self.current}/{self.total})")
-        sys.stdout.flush()
-
-    # Clear the bar, print a result line above it, then redraw the bar below
-    def print_above(self, text):
-        sys.stdout.write("\r\x1b[2K")
-        print(text)
-        if self.active:
+        with self._lock:
+            self.total = total
+            self.current = 0
+            self.active = True
             self._render()
 
+    def step(self, current=None):
+        with self._lock:
+            if not self.active:
+                return
+            self.current = self.current + 1 if current is None else current
+            self._render()
+
+    def _render(self):
+        sys.stdout.write(f"\r\x1b[2K({self.current}/{self.total})")
+        sys.stdout.flush()
+
+    # Clear the counter, print a result line above it, then redraw it below
+    def print_above(self, text):
+        with self._lock:
+            sys.stdout.write("\r\x1b[2K")
+            print(text)
+            if self.active:
+                self._render()
+
     def finish(self, label):
-        sys.stdout.write("\r\x1b[2K")
-        print(label)
-        self.active = False
+        with self._lock:
+            sys.stdout.write("\r\x1b[2K")
+            print(label)
+            self.active = False
 
 
 class RPCpwn:
@@ -205,56 +206,68 @@ class RPCpwn:
     # Endpoint confirmation: re-test discovered names directly, plus _v1.._v5 variants
     def second_stage(self):
         print("\n=== Stage 2: testing discovered endpoint names against FUZZ ===")
-        endpoints = sorted(self.endpoints)
-        self.progress.start(len(endpoints) * 6)  # base name + 5 versioned variants
+        names = []
+        for ep in sorted(self.endpoints):
+            names.append(ep)
+            names.extend(f"{ep}_v{v}" for v in range(1, 6))
+
+        self.progress.start(len(names))
+        batch_size = 10
         count = 0
-        for ep in endpoints:
-            self.test_name(ep)
-            count += 1
-            self.progress.step(count)
-            for v in range(1, 6):
-                self.test_name(f"{ep}_v{v}")
-                count += 1
-                self.progress.step(count)
+        for batch_start in range(0, len(names), batch_size):
+            batch = names[batch_start:batch_start + batch_size]
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = [executor.submit(self.test_name, name) for name in batch]
+                for future in futures:
+                    future.result()
+                    count += 1
+                    self.progress.step(count)
         self.progress.finish("Stage 2 Done")
+
+    # Single param guess against one endpoint: GET url?param=1 and classify the result
+    def _test_param(self, ep, url, param):
+        resp = self.send("get", f"{url}?{param}=1")
+        if resp is None:
+            return
+        try:
+            data = resp.json()
+        except (requests.exceptions.JSONDecodeError, ValueError):
+            return
+        # PGRST202 = function/param not found, PGRST100 = unmatched param fell through
+        # to result-filter parsing and choked on the raw value (still a wrong guess).
+        # A non-object body (bool/number/list) is a plain successful result, not an error.
+        code = data.get("code") if isinstance(data, dict) else None
+        if code not in ("PGRST202", "PGRST100"):
+            self.found_params.setdefault(ep, set()).add(param)
+            self.progress.print_above(f"{ep}: {param} ({resp.status_code}) [+]")
 
     # Parameter discovery: brute-force query-string args against every confirmed endpoint
     def third_stage(self):
         print("\n=== Stage 3: discovering parameters for confirmed endpoints ===")
 
-        total = len(self.param_targets) * len(self.param_words)
-        if total == 0:
-            print("Nothing to brute force (no confirmed endpoints or empty param wordlist).")
-            return
-
-        self.progress.start(total)
-        count = 0
+        pairs = []
         for ep, url in self.param_targets.items():
             for p in sorted(self.found_params.get(ep, [])):
                 self.progress.print_above(f"{ep}: {p} [+] (from hint)")
 
-            for param in self.param_words:
-                count += 1
-                if param in self.found_params.get(ep, set()):
+            known = self.found_params.get(ep, set())
+            pairs.extend((ep, url, param) for param in self.param_words if param not in known)
+
+        if not pairs:
+            print("Nothing to brute force (no confirmed endpoints or empty param wordlist).")
+            return
+
+        self.progress.start(len(pairs))
+        batch_size = 10
+        count = 0
+        for batch_start in range(0, len(pairs), batch_size):
+            batch = pairs[batch_start:batch_start + batch_size]
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = [executor.submit(self._test_param, ep, url, param) for ep, url, param in batch]
+                for future in futures:
+                    future.result()
+                    count += 1
                     self.progress.step(count)
-                    continue
-                resp = self.send("get", f"{url}?{param}=1")
-                if resp is None:
-                    self.progress.step(count)
-                    continue
-                try:
-                    data = resp.json()
-                except (requests.exceptions.JSONDecodeError, ValueError):
-                    self.progress.step(count)
-                    continue
-                # PGRST202 = function/param not found, PGRST100 = unmatched param fell through
-                # to result-filter parsing and choked on the raw value (still a wrong guess).
-                # A non-object body (bool/number/list) is a plain successful result, not an error.
-                code = data.get("code") if isinstance(data, dict) else None
-                if code not in ("PGRST202", "PGRST100"):
-                    self.found_params.setdefault(ep, set()).add(param)
-                    self.progress.print_above(f"{ep}: {param} ({resp.status_code}) [+]")
-                self.progress.step(count)
         self.progress.finish("Stage 3 Done")
 
     def save_output(self, output_path):
